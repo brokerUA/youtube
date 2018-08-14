@@ -16,6 +16,7 @@ class CreateYoutubeAccessTokensTable extends Migration
         {
             $table->increments('id');
             $table->text('access_token');
+            $table->string('account_id', 10);
             $table->timestamp('created_at');
         });
     }
