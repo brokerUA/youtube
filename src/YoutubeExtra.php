@@ -8,9 +8,35 @@
 
 namespace Dawson\Youtube;
 
+use Exception;
+use Carbon\Carbon;
+use Google_Client;
+use Google_Service_YouTube;
+use Illuminate\Support\Facades\DB;
 
 class YoutubeExtra extends Youtube
 {
+
+    /**
+     * Application Container
+     *
+     * @var Application
+     */
+    private $app;
+
+    /**
+     * Google Client
+     *
+     * @var \Google_Client
+     */
+    protected $client;
+
+    /**
+     * Google YouTube Service
+     *
+     * @var \Google_Service_YouTube
+     */
+    protected $youtube;
 
     /**
      * Video ID
@@ -26,7 +52,123 @@ class YoutubeExtra extends Youtube
      */
     private $snippet;
 
-    public $page_info = [];
+    /**
+     * Thumbnail URL
+     *
+     * @var string
+     */
+    private $thumbnailUrl;
+
+    public function __construct($app)
+    {
+        $this->app = $app;
+
+        foreach ($this->app->config->get('youtube.accounts') as $account_id => $config) {
+
+            $this->client[$account_id] = $this->setup($account_id, new Google_Client);
+
+            $this->youtube[$account_id] = new Google_Service_YouTube($this->client[$account_id]);
+
+            if ($accessToken[$account_id] = $this->getLatestAccessTokenFromDBWithAccount($account_id)) {
+                $this->client[$account_id]->setAccessToken($accessToken[$account_id]);
+            }
+
+        }
+
+    }
+
+    public function uploadVideo($account_id, $path, array $data = [])
+    {
+        if(!file_exists($path)) {
+            throw new Exception('Video file does not exist at path: "'. $path .'". Provide a full path to the file before attempting to upload.');
+        }
+
+        $this->handleAccessTokenWithAccount($account_id);
+
+        try {
+            $video = $this->getVideo($data);
+
+            // Set the Chunk Size
+            $chunkSize = 1 * 1024 * 1024;
+
+            // Set the defer to true
+            $this->client[$account_id]->setDefer(true);
+
+            // Build the request
+            $insert = $this->youtube[$account_id]->videos->insert('status,snippet', $video);
+
+            // Upload
+            $media = new \Google_Http_MediaFileUpload(
+                $this->client[$account_id],
+                $insert,
+                'video/*',
+                null,
+                true,
+                $chunkSize
+            );
+
+            // Set the Filesize
+            $media->setFileSize(filesize($path));
+
+            // Read the file and upload in chunks
+            $status = false;
+            $handle = fopen($path, "rb");
+
+            while (!$status && !feof($handle)) {
+                $chunk = fread($handle, $chunkSize);
+                $status = $media->nextChunk($chunk);
+            }
+
+            fclose($handle);
+
+            $this->client->setDefer(false);
+
+            // Set ID of the Uploaded Video
+            $this->videoId = $status['id'];
+
+            // Set the Snippet from Uploaded Video
+            $this->snippet = $status['snippet'];
+
+        }  catch (\Google_Service_Exception $e) {
+            throw new Exception($e->getMessage());
+        } catch (\Google_Exception $e) {
+            throw new Exception($e->getMessage());
+        }
+
+        return $this;
+    }
+
+    public function updateVideo($account_id, $id, array $data = [])
+    {
+        $this->handleAccessTokenWithAccount($account_id);
+
+        if (!$this->existsWithAccount($account_id, $id)) {
+            throw new Exception('A video matching id "'. $id .'" could not be found.');
+        }
+
+        try {
+            $video = $this->getVideo($data, $id);
+
+            $status = $this->youtube[$account_id]->videos->update('status,snippet', $video);
+
+            // Set ID of the Updated Video
+            $this->videoId = $status['id'];
+
+            // Set the Snippet from Updated Video
+            $this->snippet = $status['snippet'];
+
+        }  catch (\Google_Service_Exception $e) {
+
+            throw new Exception($e->getMessage());
+
+        } catch (\Google_Exception $e) {
+
+            throw new Exception($e->getMessage());
+
+        }
+
+        return $this;
+    }
 
     /**
      * @param $data
@@ -82,106 +224,123 @@ class YoutubeExtra extends Youtube
 
     }
 
-    public function upload($path, array $data = [], $privacyStatus = 'public')
+    /**
+     * Check if a YouTube video exists by it's ID.
+     *
+     * @param  int  $id
+     *
+     * @return bool
+     */
+    public function existsWithAccount($account_id, $id)
     {
-        return $this->uploadVideo($path, $data);
+        $this->handleAccessTokenWithAccount($account_id);
+
+        $response = $this->youtube[$account_id]->videos->listVideos('status', ['id' => $id]);
+
+        if (empty($response->items)) return false;
+
+        return true;
     }
-    public function uploadVideo($path, array $data = [])
+
+    /**
+     * Setup the Google Client
+     *
+     * @param Google_Client $client
+     * @return Google_Client $client
+     * @throws Exception
+     */
+    private function setup($account_id, Google_Client $client)
     {
-        if(!file_exists($path)) {
-            throw new Exception('Video file does not exist at path: "'. $path .'". Provide a full path to the file before attempting to upload.');
+
+        if(
+            !$this->app->config->get('youtube.accounts.'.$account_id.'.client_id') ||
+            !$this->app->config->get('youtube.accounts.'.$account_id.'.client_secret')
+        ) {
+            throw new Exception('A Google "client_id" and "client_secret" must be configured.');
         }
 
-        $this->handleAccessToken();
+        $client->setClientId($this->app->config->get('youtube.accounts.'.$account_id.'.client_id'));
+        $client->setClientSecret($this->app->config->get('youtube.accounts.'.$account_id.'.client_secret'));
+        $client->setScopes($this->app->config->get('youtube.accounts.'.$account_id.'.scopes'));
+        $client->setAccessType('offline');
+        $client->setApprovalPrompt('force');
+        $client->setRedirectUri(url(
+            $this->app->config->get('youtube.accounts.'.$account_id.'.routes.prefix')
+            . '/' .
+            $this->app->config->get('youtube.accounts.'.$account_id.'.routes.redirect_uri')
+        ));
 
-        try {
-            $video = $this->getVideo($data);
+        return $client;
+    }
 
-            // Set the Chunk Size
-            $chunkSize = 1 * 1024 * 1024;
+    /**
+     * Saves the access token to the database.
+     *
+     * @param  string  $accessToken
+     */
+    public function saveAccessTokenToDBWithAccount($account_id, $accessToken)
+    {
+        return DB::table('youtube_access_tokens')->insert([
+            'access_token' => json_encode($accessToken),
+            'account_id' => $account_id,
+            'created_at'   => Carbon::createFromTimestamp($accessToken['created'])
+        ]);
+    }
 
-            // Set the defer to true
-            $this->client->setDefer(true);
+    /**
+     * Get the latest access token from the database.
+     *
+     * @return string
+     */
+    public function getLatestAccessTokenFromDBWithAccount($account_id)
+    {
+        $latest = DB::table('youtube_access_tokens')
+            ->where('account_id', $account_id)
+            ->latest('created_at')
+            ->first();
 
-            // Build the request
-            $insert = $this->youtube->videos->insert('status,snippet', $video);
+        return $latest ? (is_array($latest) ? $latest['access_token'] : $latest->access_token ) : null;
+    }
 
-            // Upload
-            $media = new \Google_Http_MediaFileUpload(
-                $this->client,
-                $insert,
-                'video/*',
-                null,
-                true,
-                $chunkSize
-            );
+    /**
+     * Handle the Access Token
+     *
+     * @return void
+     */
+    public function handleAccessTokenWithAccount($account_id)
+    {
 
-            // Set the Filesize
-            $media->setFileSize(filesize($path));
+        if (is_null($accessToken[$account_id] = $this->client[$account_id]->getAccessToken())) {
+            throw new \Exception('An access token is required.');
+        }
 
-            // Read the file and upload in chunks
-            $status = false;
-            $handle = fopen($path, "rb");
+        if($this->client[$account_id]->isAccessTokenExpired())
+        {
+            // If we have a "refresh_token"
+            if (array_key_exists('refresh_token', $accessToken[$account_id]))
+            {
+                // Refresh the access token
+                $this->client[$account_id]->refreshToken($accessToken[$account_id]['refresh_token']);
 
-            while (!$status && !feof($handle)) {
-                $chunk = fread($handle, $chunkSize);
-                $status = $media->nextChunk($chunk);
+                // Save the access token
+                $this->saveAccessTokenToDBWithAccount($account_id, $this->client[$account_id]->getAccessToken());
             }
-
-            fclose($handle);
-
-            $this->client->setDefer(false);
-
-            // Set ID of the Uploaded Video
-            $this->videoId = $status['id'];
-
-            // Set the Snippet from Uploaded Video
-            $this->snippet = $status['snippet'];
-
-        }  catch (\Google_Service_Exception $e) {
-            throw new Exception($e->getMessage());
-        } catch (\Google_Exception $e) {
-            throw new Exception($e->getMessage());
         }
-
-        return $this;
     }
 
-    public function update($id, array $data = [], $privacyStatus = 'public')
+    public function createAuthUrl($account_id)
     {
-        return $this->updateVideo($id, $data);
+        return $this->client[$account_id]->createAuthUrl();
     }
-    public function updateVideo($id, array $data = [])
+
+    public function authenticate($account_id, $code)
     {
-        $this->handleAccessToken();
-
-        if (!$this->exists($id)) {
-            throw new Exception('A video matching id "'. $id .'" could not be found.');
-        }
-
-        try {
-            $video = $this->getVideo($data, $id);
-
-            $status = $this->youtube->videos->update('status,snippet', $video);
-
-            // Set ID of the Updated Video
-            $this->videoId = $status['id'];
-
-            // Set the Snippet from Updated Video
-            $this->snippet = $status['snippet'];
-
-        }  catch (\Google_Service_Exception $e) {
-
-            throw new Exception($e->getMessage());
-
-        } catch (\Google_Exception $e) {
-
-            throw new Exception($e->getMessage());
-
-        }
-
-        return $this;
+        return $this->client[$account_id]->authenticate($code);
     }
+
+
+
+
 
     /**
      * Get items in a playlist by playlist ID, return an array of PHP objects
@@ -194,6 +353,7 @@ class YoutubeExtra extends Youtube
      * @throws \Exception
      */
     public function getPlaylistItemsByPlaylistId(
+        $account_id,
         $playlistId,
         $pageToken = '',
         $maxResults = 50,
@@ -201,11 +361,11 @@ class YoutubeExtra extends Youtube
     )
     {
 
-        $this->handleAccessToken();
+        $this->handleAccessTokenWithAccount($account_id);
 
         try {
 
-            $apiData = $this->youtube->playlistItems->listPlaylistItems(
+            $apiData = $this->youtube[$account_id]->playlistItems->listPlaylistItems(
                 implode(', ', $part),
                 [
                     'maxResults' => $maxResults,
@@ -231,6 +391,8 @@ class YoutubeExtra extends Youtube
 
         return $result;
     }
+
+    public $page_info = [];
 
     /**
      * Decode the response from youtube, extract the list of resource objects
@@ -271,5 +433,7 @@ class YoutubeExtra extends Youtube
             }
         }
     }
+
+
 
 }
