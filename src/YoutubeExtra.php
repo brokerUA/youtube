@@ -13,6 +13,7 @@ use Carbon\Carbon;
 use Google_Client;
 use Google_Service_YouTube;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
 
 class YoutubeExtra extends Youtube
 {
@@ -70,7 +71,9 @@ class YoutubeExtra extends Youtube
             $this->youtube[$account_id] = new Google_Service_YouTube($this->client[$account_id]);
 
             if ($accessToken[$account_id] = $this->getLatestAccessTokenFromDBWithAccount($account_id)) {
+
                 $this->client[$account_id]->setAccessToken($accessToken[$account_id]);
+
             }
 
         }
@@ -280,11 +283,7 @@ class YoutubeExtra extends Youtube
      */
     public function saveAccessTokenToDBWithAccount($account_id, $accessToken)
     {
-        return DB::table('youtube_access_tokens')->insert([
-            'access_token' => json_encode($accessToken),
-            'account_id' => $account_id,
-            'created_at'   => Carbon::createFromTimestamp($accessToken['created'])
-        ]);
+        return Storage::put($account_id . '_YOUTUBE_ACCESS', json_encode($accessToken), 'private');
     }
 
     /**
@@ -294,12 +293,16 @@ class YoutubeExtra extends Youtube
      */
     public function getLatestAccessTokenFromDBWithAccount($account_id)
     {
-        $latest = DB::table('youtube_access_tokens')
-            ->where('account_id', $account_id)
-            ->latest('created_at')
-            ->first();
 
-        return $latest ? (is_array($latest) ? $latest['access_token'] : $latest->access_token ) : null;
+        try {
+            $access = Storage::get($account_id . '_YOUTUBE_ACCESS');
+            $access = json_decode($access, true);
+        } catch (\Exception $e) {
+            return null;
+        }
+
+        return $access ?? null;
+
     }
 
     /**
@@ -314,18 +317,21 @@ class YoutubeExtra extends Youtube
             throw new \Exception('An access token is required.');
         }
 
-        if($this->client[$account_id]->isAccessTokenExpired())
-        {
+        if ($this->client[$account_id]->isAccessTokenExpired()) {
+
             // If we have a "refresh_token"
-            if (array_key_exists('refresh_token', $accessToken[$account_id]))
-            {
+            if (array_key_exists('refresh_token', $accessToken[$account_id])) {
+
                 // Refresh the access token
                 $this->client[$account_id]->refreshToken($accessToken[$account_id]['refresh_token']);
 
                 // Save the access token
                 $this->saveAccessTokenToDBWithAccount($account_id, $this->client[$account_id]->getAccessToken());
+
             }
+
         }
+
     }
 
     public function createAuthUrl($account_id)
